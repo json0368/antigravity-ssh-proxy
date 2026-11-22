@@ -52,16 +52,52 @@ async function isMgraftcpRunning(): Promise<boolean> {
 }
 
 /**
- * Get Language Server process info
- * Returns PID and whether it's running in persistent mode
- * 
- * When LS runs through mgraftcp, ps shows two processes:
- * 1. mgraftcp process (parent, contains "language_server_linux" as argument)
- * 2. actual language_server process (child, the .bak binary)
- * 
- * We need to find the actual LS process and determine if it was started via mgraftcp
+ * Check if a running process has HTTP_PROXY / HTTPS_PROXY configured in its environment.
  */
-async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: boolean; isUsingProxy: boolean } | null> {
+async function isProcessUsingEnvProxy(pid: number): Promise<boolean> {
+	try {
+		const envBuf = await fs.readFile(`/proc/${pid}/environ`);
+		const envEntries = envBuf.toString('utf-8').split('\0');
+		return envEntries.some(entry =>
+			entry.startsWith('HTTPS_PROXY=') ||
+			entry.startsWith('HTTP_PROXY=') ||
+			entry.startsWith('https_proxy=') ||
+			entry.startsWith('http_proxy=')
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get Antigravity backend process info (AGY 2.x+ hub or legacy language_server_linux).
+ * Returns PID, whether it's persistent, whether it's using proxy, and backend kind.
+ */
+async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: boolean; isUsingProxy: boolean; kind: 'agy' | 'legacy' } | null> {
+	// 1. Check Antigravity 2.x+ backend: ~/.gemini/bin/agy --hub
+	try {
+		const { stdout } = await execAsync('ps aux | grep -E "bin/agy(\\.bak)?[[:space:]].*--hub" | grep -v grep');
+		const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+		for (const line of lines) {
+			const parts = line.split(/\s+/);
+			if (parts.length >= 2) {
+				const pid = parseInt(parts[1]);
+				if (!isNaN(pid)) {
+					const isUsingProxy = await isProcessUsingEnvProxy(pid);
+					return {
+						pid,
+						isPersistent: true,
+						isUsingProxy,
+						kind: 'agy'
+					};
+				}
+			}
+		}
+	} catch {
+		// No agy --hub process found, fall through to legacy check
+	}
+
+	// 2. Fallback: legacy Antigravity 1.x language_server_linux
 	try {
 		const { stdout } = await execAsync('ps aux | grep language_server_linux | grep -v grep');
 		const lines = stdout.trim().split('\n').filter(l => l.length > 0);
@@ -87,7 +123,8 @@ async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: 
 						return { 
 							pid, 
 							isPersistent, 
-							isUsingProxy: hasMgraftcpWrapper 
+							isUsingProxy: hasMgraftcpWrapper,
+							kind: 'legacy'
 						};
 					}
 				}
@@ -599,29 +636,34 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 		log(`  Result: ${proxyReachable ? '✓ Port is reachable' : '✗ Port is NOT reachable'}`);
 		log('');
 
-		// Test 2: mgraftcp process
-		log(`[Test 2] Checking if mgraftcp is running...`);
-		log(`  Command: pgrep -f mgraftcp`);
-		const proxyActive = await isMgraftcpRunning();
-		log(`  Result: ${proxyActive ? '✓ mgraftcp is running (proxy active)' : '✗ mgraftcp is NOT running'}`);
+		// Test 2: Backend proxy status (AGY env-proxy or legacy mgraftcp)
+		log(`[Test 2] Checking backend proxy status...`);
+		const mgraftcpRunning = await isMgraftcpRunning();
+		const lsProcess = await getLanguageServerProcess();
+		const proxyActive = mgraftcpRunning || Boolean(lsProcess?.kind === 'agy' && lsProcess.isUsingProxy);
+		if (lsProcess?.kind === 'agy') {
+			log(`  Result: ${lsProcess.isUsingProxy ? '✓ AGY Hub is running with env proxy (proxy active)' : '✗ AGY Hub is running WITHOUT proxy'}`);
+		} else {
+			log(`  Command: pgrep -f mgraftcp`);
+			log(`  Result: ${mgraftcpRunning ? '✓ mgraftcp is running (proxy active)' : '✗ mgraftcp is NOT running'}`);
+		}
 		log('');
 
-		// Test 2.5: Language Server process status (always check for diagnostic purposes)
-		log(`[Test 2.5] Checking Language Server process status...`);
-		const lsProcess = await getLanguageServerProcess();
+		// Test 2.5: Backend process status (always check for diagnostic purposes)
+		log(`[Test 2.5] Checking Antigravity backend process status...`);
 		if (lsProcess) {
-			const modeLabel = lsProcess.isPersistent ? 'persistent mode' : 'normal mode';
+			const backendName = lsProcess.kind === 'agy' ? 'AGY Hub' : 'Language Server';
+			const modeLabel = lsProcess.kind === 'agy' ? 'hub mode' : (lsProcess.isPersistent ? 'persistent mode' : 'normal mode');
 			const proxyLabel = lsProcess.isUsingProxy ? 'using proxy' : 'NOT using proxy';
 			const statusIcon = lsProcess.isUsingProxy ? '✓' : (lsProcess.isPersistent ? '✗' : '⚠');
-			log(`  Result: ${statusIcon} Language Server (PID ${lsProcess.pid}) is running in ${modeLabel}, ${proxyLabel}`);
+			log(`  Result: ${statusIcon} ${backendName} (PID ${lsProcess.pid}) is running in ${modeLabel}, ${proxyLabel}`);
 			
 			if (lsProcess.isPersistent && !lsProcess.isUsingProxy) {
-				log(`  ⚠️ WARNING: LS is in persistent_mode but not using proxy!`);
-				log(`    This is the bug scenario where LS was started before wrapper was configured.`);
-				log(`    Will auto-fix by killing LS process...`);
+				log(`  ⚠️ WARNING: ${backendName} was started before wrapper was configured!`);
+				log(`    Will auto-fix by restarting backend process...`);
 			}
 		} else {
-			log(`  Result: ○ Language Server is not running (will start on demand)`);
+			log(`  Result: ○ Antigravity backend is not running (will start on demand)`);
 		}
 		log('');
 

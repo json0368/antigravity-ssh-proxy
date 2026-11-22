@@ -294,30 +294,45 @@ async function checkLanguageServerWrapper(extensionPath?: string): Promise<Diagn
             return check;
         }
         
-        // Search in all possible server directories
+        // Search for Antigravity 2.x+ agy binary first, then legacy language_server_linux_*
         let targetPath = '';
-        for (const dirName of SERVER_DIR_NAMES) {
-            try {
-                const { stdout } = await execAsync(
-                    `find "$HOME/${dirName}/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" | head -1`
-                );
-                targetPath = stdout.trim();
-                if (targetPath) { break; }
-            } catch {
-                // continue to next directory
+        let isAgy = false;
+        const agyPath = path.join(homeDir, '.gemini', 'bin', 'agy');
+        try {
+            await fs.access(agyPath, fs.constants.F_OK);
+            targetPath = agyPath;
+            isAgy = true;
+        } catch {
+            // Fall through to legacy language_server_linux_* search
+        }
+
+        if (!targetPath) {
+            for (const dirName of SERVER_DIR_NAMES) {
+                try {
+                    const { stdout } = await execAsync(
+                        `find "$HOME/${dirName}/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" | head -1`
+                    );
+                    targetPath = stdout.trim();
+                    if (targetPath) { break; }
+                } catch {
+                    // continue to next directory
+                }
             }
         }
 
         if (!targetPath) {
             check.status = 'warning';
-            check.message = 'Language server binary not found';
+            check.message = 'Antigravity backend binary (agy / language_server) not found';
             check.suggestion = 'This may be normal if Antigravity extension is not installed.';
             return check;
         }
 
         // Check if it's a wrapper script
         const content = await fs.readFile(targetPath, 'utf-8');
-        if (content.startsWith('#!/bin/bash') && content.includes('mgraftcp')) {
+        const isValidAgyWrapper = isAgy && content.startsWith('#!/bin/bash') && content.includes('WRAPPER_MODE="env-proxy"');
+        const isValidLegacyWrapper = !isAgy && content.startsWith('#!/bin/bash') && content.includes('mgraftcp');
+
+        if (isValidAgyWrapper || isValidLegacyWrapper) {
             check.status = 'success';
             
             // Extract wrapper version
@@ -340,7 +355,8 @@ async function checkLanguageServerWrapper(extensionPath?: string): Promise<Diagn
                 }
             }
 
-            check.message = `Language server wrapper is configured (Wrapper v${wrapperVersion}, Extension v${extensionVersion})`;
+            const wrapperKind = isAgy ? 'AGY Hub env-proxy wrapper' : 'Language server wrapper';
+            check.message = `${wrapperKind} is configured (Wrapper v${wrapperVersion}, Extension v${extensionVersion})`;
             
             // Warn if versions mismatch
             if (extensionVersion !== 'unknown' && wrapperVersion !== 'unknown' && 
@@ -351,7 +367,9 @@ async function checkLanguageServerWrapper(extensionPath?: string): Promise<Diagn
             }
         } else {
             check.status = 'warning';
-            check.message = 'Language server is not wrapped with mgraftcp';
+            check.message = isAgy
+                ? 'AGY binary (~/.gemini/bin/agy) is not wrapped with proxy settings'
+                : 'Language server is not wrapped with mgraftcp';
             check.suggestion = 'Run "Setup Remote Environment" command to configure the wrapper.';
         }
     } catch (error) {
@@ -372,8 +390,7 @@ async function checkLanguageServerWrapper(extensionPath?: string): Promise<Diagn
 }
 
 /**
- * Check Language Server process status
- * Detects if LS is running, in persistent mode, and using proxy
+ * Check Antigravity backend process status (AGY 2.x+ hub or legacy Language Server)
  */
 async function checkLanguageServerProcess(): Promise<DiagnosticCheck> {
     const check: DiagnosticCheck = {
@@ -382,6 +399,42 @@ async function checkLanguageServerProcess(): Promise<DiagnosticCheck> {
         status: 'running'
     };
 
+    // 1. Check Antigravity 2.x+ AGY hub process first
+    try {
+        const { stdout } = await execAsync('ps aux | grep -E "bin/agy(\\.bak)?[[:space:]].*--hub" | grep -v grep');
+        const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+        if (lines.length > 0) {
+            const parts = lines[0].split(/\s+/);
+            const pid = parts.length >= 2 ? parseInt(parts[1]) : 0;
+            let proxyVal = '';
+            if (pid > 0 && !isNaN(pid)) {
+                try {
+                    const envBuf = await fs.readFile(`/proc/${pid}/environ`);
+                    const entries = envBuf.toString('utf-8').split('\0');
+                    const proxyEntry = entries.find(e => e.startsWith('HTTPS_PROXY=') || e.startsWith('HTTP_PROXY='));
+                    if (proxyEntry) {
+                        proxyVal = proxyEntry.split('=').slice(1).join('=');
+                    }
+                } catch {
+                    // ignore
+                }
+            }
+
+            if (proxyVal) {
+                check.status = 'success';
+                check.message = `AGY Hub (PID ${pid}) is running, using proxy (${proxyVal})`;
+            } else {
+                check.status = 'error';
+                check.message = `AGY Hub (PID ${pid}) is running, but NOT using proxy`;
+                check.suggestion = `AGY Hub was started before the proxy wrapper was configured. Run "kill ${pid}" in terminal, then reload window.`;
+            }
+            return check;
+        }
+    } catch {
+        // Not running or grep returned non-zero, fall through to legacy check
+    }
+
+    // 2. Fallback: legacy Antigravity 1.x language_server_linux
     try {
         const { stdout } = await execAsync('ps aux | grep language_server_linux | grep -v grep');
         const lines = stdout.trim().split('\n').filter(l => l.length > 0);

@@ -8,6 +8,7 @@ export function generateSetupScript(proxyHost: string, proxyPort: number, proxyT
     // Replace placeholders
     script = script.replace(/__PROXY_HOST__/g, proxyHost);
     script = script.replace(/__PROXY_PORT__/g, String(proxyPort));
+    script = script.replace(/__PROXY_TYPE__/g, proxyType);
 
     return script;
 }
@@ -18,6 +19,9 @@ set -e
 
 # Search in all possible server directories (new name first, then legacy)
 BAKS=""
+if [ -f "$HOME/.gemini/bin/agy.bak" ]; then
+    BAKS="$HOME/.gemini/bin/agy.bak"
+fi
 for DIR in "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server"; do
     FOUND=$(find "$DIR" -path "*/extensions/antigravity/bin/*" -name "language_server_linux_*.bak" -type f 2>/dev/null)
     [ -n "$FOUND" ] && BAKS="$BAKS

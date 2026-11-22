@@ -105,13 +105,15 @@ for dir in "${POSSIBLE_SERVER_DIRS[@]}"; do
     fi
 done
 
-if [ -z "$SERVER_DIR" ]; then
-    error_log "No Antigravity server directory found!"
-    error_log "Searched: ${POSSIBLE_SERVER_DIRS[*]}"
+if [ -z "$SERVER_DIR" ] && [ ! -f "$HOME/.gemini/bin/agy" ]; then
+    error_log "No Antigravity server directory or agy binary found!"
+    error_log "Searched: ${POSSIBLE_SERVER_DIRS[*]} $HOME/.gemini/bin/agy"
     exit 1
 fi
 
-info_log "Server Directory: $SERVER_DIR"
+if [ -n "$SERVER_DIR" ]; then
+    info_log "Server Directory: $SERVER_DIR"
+fi
 
 # ============================================================================
 # Scan for extension directories (for debugging)
@@ -207,27 +209,47 @@ check_needs_update() {
 }
 
 # ============================================================================
-# Find Language Servers
+# Find Antigravity Backends (AGY 2.x+ Hub/CLI & Legacy Language Servers)
 # ============================================================================
-echo "[SEARCH] Looking for language servers..."
-TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$")
+echo "[SEARCH] Looking for Antigravity backend binaries..."
+TARGETS=""
+
+# 1. Antigravity IDE 2.6+ / 2.7+ backend: ~/.gemini/bin/agy
+AGY_BIN="$HOME/.gemini/bin/agy"
+if [ -f "$AGY_BIN" ]; then
+    TARGETS="$AGY_BIN"
+    info_log "Found Antigravity 2.x+ binary: $AGY_BIN"
+fi
+
+# 2. Legacy Antigravity 1.x language servers
+if [ -n "$SERVER_DIR" ]; then
+    LEGACY_TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" || true)
+    if [ -n "$LEGACY_TARGETS" ]; then
+        if [ -n "$TARGETS" ]; then
+            TARGETS="${TARGETS}
+${LEGACY_TARGETS}"
+        else
+            TARGETS="$LEGACY_TARGETS"
+        fi
+    fi
+fi
 
 if [ -z "$TARGETS" ]; then
-    error_log "No language servers found!"
+    error_log "No Antigravity backend binaries (agy or language_server_linux) found!"
     exit 1
 fi
 
 TARGET_COUNT=$(echo "$TARGETS" | wc -l)
-info_log "Found $TARGET_COUNT language server(s)"
+info_log "Found $TARGET_COUNT backend binary(ies)"
 echo ""
 
 # ============================================================================
-# Process Each Language Server
+# Process Each Target Binary
 # ============================================================================
 CONFIGURED_COUNT=0
 SKIPPED_COUNT=0
 
-echo "[PROCESS] Configuring language servers..."
+echo "[PROCESS] Configuring backend wrappers..."
 echo ""
 
 while IFS= read -r TARGET; do
@@ -236,6 +258,10 @@ while IFS= read -r TARGET; do
     echo "----------------------------------------"
     echo "Target: $TARGET"
     BAK="${TARGET}.bak"
+    IS_AGY=0
+    if [ "$(basename "$TARGET")" = "agy" ]; then
+        IS_AGY=1
+    fi
     
     # Check if update is needed
     if UPDATE_REASON=$(check_needs_update "$TARGET"); then
@@ -255,25 +281,67 @@ while IFS= read -r TARGET; do
         continue
     fi
 
-    # Create backup if needed
-    if [ ! -f "$BAK" ]; then
-        if is_wrapper_script "$TARGET"; then
-            error_log "Target is a wrapper script but no backup exists!"
-            error_log "Cannot proceed without original binary backup"
-            continue
-        fi
-        mv "$TARGET" "$BAK"
-        info_log "Backup created: $BAK"
+    # Create or refresh backup if target is an unwrapped real binary
+    if ! is_wrapper_script "$TARGET"; then
+        mv -f "$TARGET" "$BAK"
+        info_log "Backup created/updated: $BAK"
+    elif [ ! -f "$BAK" ]; then
+        error_log "Target is a wrapper script but no backup exists!"
+        error_log "Cannot proceed without original binary backup"
+        continue
     else
         debug_log "Backup already exists: $BAK"
     fi
 
-    # ========================================================================
-    # Create Wrapper Script
-    # ========================================================================
-    # The wrapper script dynamically finds mgraftcp-fakedns at runtime,
-    # allowing version upgrades without breaking existing wrappers.
-    # ========================================================================
+    if [ "$IS_AGY" = "1" ]; then
+        # ====================================================================
+        # Create AGY Env-Proxy Wrapper Script (Antigravity 2.x+)
+        # ====================================================================
+        # agy natively honors HTTP_PROXY/HTTPS_PROXY/NO_PROXY via Go's
+        # net/http.ProxyFromEnvironment. Using env vars avoids ptrace/fakedns
+        # overhead and hangs on Go binaries.
+        # ====================================================================
+cat > "$TARGET" << 'AGY_WRAPPER_EOF'
+#!/bin/bash
+# ============================================================================
+# Antigravity SSH Proxy - AGY Hub/CLI Wrapper (Antigravity 2.x+)
+# ============================================================================
+# WRAPPER_VERSION="__EXTENSION_VERSION_PLACEHOLDER__"
+# WRAPPER_MODE="env-proxy"
+# GENERATED="__TIMESTAMP_PLACEHOLDER__"
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+
+# Proxy configuration
+PROXY_ADDR="__PROXY_ADDR_PLACEHOLDER__"
+PROXY_TYPE="__PROXY_TYPE_PLACEHOLDER__"
+
+if [ "$PROXY_TYPE" = "socks5" ]; then
+    PROXY_URL="socks5://${PROXY_ADDR}"
+else
+    PROXY_URL="http://${PROXY_ADDR}"
+fi
+
+export HTTP_PROXY="$PROXY_URL"
+export HTTPS_PROXY="$PROXY_URL"
+export http_proxy="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export ALL_PROXY="$PROXY_URL"
+export all_proxy="$PROXY_URL"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost,::1"
+export no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost,::1"
+
+exec "$SCRIPT_DIR/$SCRIPT_NAME.bak" "$@"
+AGY_WRAPPER_EOF
+    else
+        # ====================================================================
+        # Create Legacy Language Server Wrapper Script (mgraftcp-fakedns)
+        # ====================================================================
+        # The wrapper script dynamically finds mgraftcp-fakedns at runtime,
+        # allowing version upgrades without breaking existing wrappers.
+        # ====================================================================
 cat > "$TARGET" << 'WRAPPER_EOF'
 #!/bin/bash
 # ============================================================================
@@ -356,6 +424,7 @@ else
     exec "$MGRAFTCP_PATH" --http_proxy "$PROXY_ADDR" "$SCRIPT_DIR/$SCRIPT_NAME.bak" "$@"
 fi
 WRAPPER_EOF
+    fi
 
     # Replace placeholders with actual values
     sed -i "s|__PROXY_ADDR_PLACEHOLDER__|$PROXY_ADDR|g" "$TARGET"
