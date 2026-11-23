@@ -469,6 +469,130 @@ async function ensureMgraftcpExecutable(extensionPath: string): Promise<void> {
 	}
 }
 
+/**
+ * Sync remote IDE http.proxy / http.proxySupport settings so the remote extensionHost
+ * (Node.js) can download the Antigravity backend (~/.gemini/bin/agy) on fresh servers.
+ */
+async function syncRemoteHttpProxy(proxyHost: string, proxyPort: number, proxyType: string): Promise<boolean> {
+	const atpConfig = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
+	const shouldSync = atpConfig.get<boolean>('syncRemoteHttpProxy', true);
+	if (!shouldSync) {
+		return false;
+	}
+
+	const proxyUrl = `${proxyType === 'socks5' ? 'socks5' : 'http'}://${proxyHost}:${proxyPort}`;
+	const httpConfig = vscode.workspace.getConfiguration('http');
+	const currentProxy = httpConfig.get<string>('proxy', '');
+	const currentSupport = httpConfig.get<string>('proxySupport', 'override');
+	let changed = false;
+
+	try {
+		if (currentProxy !== proxyUrl) {
+			await httpConfig.update('proxy', proxyUrl, vscode.ConfigurationTarget.Global);
+			log(`Synced remote http.proxy to ${proxyUrl}`);
+			changed = true;
+		}
+		if (currentSupport !== 'on' && currentSupport !== 'override') {
+			await httpConfig.update('proxySupport', 'override', vscode.ConfigurationTarget.Global);
+			log(`Synced remote http.proxySupport to override`);
+			changed = true;
+		}
+	} catch (error) {
+		log(`Failed to sync remote http.proxy: ${error}`);
+	}
+
+	return changed;
+}
+
+/**
+ * Clear remote http.proxy on rollback if it matches our configured proxy URL.
+ */
+async function clearRemoteHttpProxyIfManaged(proxyHost: string, proxyPort: number, proxyType: string): Promise<void> {
+	const proxyUrl = `${proxyType === 'socks5' ? 'socks5' : 'http'}://${proxyHost}:${proxyPort}`;
+	const httpConfig = vscode.workspace.getConfiguration('http');
+	const currentProxy = httpConfig.get<string>('proxy', '');
+	if (currentProxy === proxyUrl) {
+		try {
+			await httpConfig.update('proxy', undefined, vscode.ConfigurationTarget.Global);
+			log(`Cleared managed remote http.proxy (${proxyUrl})`);
+		} catch (error) {
+			log(`Failed to clear remote http.proxy: ${error}`);
+		}
+	}
+}
+
+/**
+ * Check whether a file is an unwrapped Linux ELF binary (starts with \x7fELF).
+ */
+async function isElfBinary(filePath: string): Promise<boolean> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, 'r');
+		const header = Buffer.alloc(4);
+		const { bytesRead } = await handle.read(header, 0, 4, 0);
+		return bytesRead === 4 &&
+			header[0] === 0x7f &&
+			header[1] === 0x45 &&
+			header[2] === 0x4c &&
+			header[3] === 0x46;
+	} catch {
+		return false;
+	} finally {
+		await handle?.close();
+	}
+}
+
+/**
+ * Watch for ~/.gemini/bin/agy to finish downloading on a fresh remote server.
+ * Once the ELF binary appears and is executable, automatically wrap it and restart agy --hub.
+ */
+function watchForAgyBinary(context: vscode.ExtensionContext, extensionPath: string): void {
+	const agyPath = path.join(os.homedir(), '.gemini', 'bin', 'agy');
+	const pollIntervalMs = 3000;
+	const maxDurationMs = 10 * 60 * 1000; // 10 minutes
+	const startedAt = Date.now();
+	let busy = false;
+
+	log(`Watching for Antigravity backend binary at ${agyPath}...`);
+
+	const timer = setInterval(async () => {
+		if (busy) {
+			return;
+		}
+		if (Date.now() - startedAt > maxDurationMs) {
+			clearInterval(timer);
+			log('Stopped watching for ~/.gemini/bin/agy (timeout reached)');
+			return;
+		}
+
+		busy = true;
+		try {
+			await fs.access(agyPath, fs.constants.X_OK);
+			if (await isElfBinary(agyPath)) {
+				// Wait briefly so any rename/write settles completely
+				await new Promise(resolve => setTimeout(resolve, 1500));
+				if (await isElfBinary(agyPath)) {
+					clearInterval(timer);
+					const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
+					const host = cfg.get<string>('remoteProxyHost', '127.0.0.1');
+					const port = cfg.get<number>('remoteProxyPort', 7890);
+					const type = cfg.get<string>('proxyType', 'http');
+					log(`Detected downloaded ELF binary at ${agyPath}, running setup...`);
+					const success = await runSetupScriptSilently(host, port, type, extensionPath);
+					statusManager.updateLanguageServerStatus(success);
+					await statusManager.refreshStatus();
+				}
+			}
+		} catch {
+			// Binary not present or not executable yet
+		} finally {
+			busy = false;
+		}
+	}, pollIntervalMs);
+
+	context.subscriptions.push({ dispose: () => clearInterval(timer) });
+}
+
 async function activateRemote(context: vscode.ExtensionContext) {
 	const config = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
 	// Remote only cares about remoteProxyHost, remoteProxyPort, and proxyType
@@ -487,6 +611,9 @@ async function activateRemote(context: vscode.ExtensionContext) {
 	// Ensure mgraftcp binary has execute permission before setup
 	await ensureMgraftcpExecutable(extensionPath);
 
+	// Sync remote IDE http.proxy so extensionHost itself can download ~/.gemini/bin/agy on fresh servers
+	const httpProxySynced = await syncRemoteHttpProxy(remoteHost, remotePort, proxyType);
+
 	// 设置配置变更回调（用于面板中修改配置时触发）
 	statusManager.setConfigChangeCallback(async () => {
 		const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
@@ -494,6 +621,7 @@ async function activateRemote(context: vscode.ExtensionContext) {
 		const port = cfg.get<number>('remoteProxyPort', 7890);
 		const type = cfg.get<string>('proxyType', 'http');
 		log(`Config changed from panel, re-running setup: ${host}:${port} (${type})`);
+		await syncRemoteHttpProxy(host, port, type);
 		const success = await runSetupScriptSilently(host, port, type, extensionPath);
 		statusManager.updateLanguageServerStatus(success);
 	});
@@ -509,17 +637,29 @@ async function activateRemote(context: vscode.ExtensionContext) {
 	const setupSuccess = await runSetupScriptSilently(remoteHost, remotePort, proxyType, extensionPath);
 	statusManager.updateLanguageServerStatus(setupSuccess);
 
+	// On fresh servers where ~/.gemini/bin/agy hasn't finished downloading yet, watch for it
+	if (!setupSuccess) {
+		watchForAgyBinary(context, extensionPath);
+		if (httpProxySynced) {
+			promptReloadWindow(
+				`Remote http.proxy configured (${remoteHost}:${remotePort}) for downloading Antigravity backend. Reload window if backend download timed out.`
+			);
+		}
+	}
+
 	// Watch config changes (from VS Code settings)
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration(async (e: vscode.ConfigurationChangeEvent) => {
 			if (e.affectsConfiguration('antigravity-ssh-proxy.remoteProxyHost') ||
 				e.affectsConfiguration('antigravity-ssh-proxy.remoteProxyPort') ||
-				e.affectsConfiguration('antigravity-ssh-proxy.proxyType')) {
+				e.affectsConfiguration('antigravity-ssh-proxy.proxyType') ||
+				e.affectsConfiguration('antigravity-ssh-proxy.syncRemoteHttpProxy')) {
 				const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
 				const host = cfg.get<string>('remoteProxyHost', '127.0.0.1');
 				const port = cfg.get<number>('remoteProxyPort', 7890);
 				const type = cfg.get<string>('proxyType', 'http');
 				log(`Config changed, re-running setup: ${host}:${port} (${type})`);
+				await syncRemoteHttpProxy(host, port, type);
 				const success = await runSetupScriptSilently(host, port, type, extensionPath);
 				statusManager.updateLanguageServerStatus(success);
 				await statusManager.refreshStatus();
@@ -529,17 +669,25 @@ async function activateRemote(context: vscode.ExtensionContext) {
 
 	// Remote commands
 	context.subscriptions.push(
-		vscode.commands.registerCommand('antigravity-ssh-proxy.setup', () => {
+		vscode.commands.registerCommand('antigravity-ssh-proxy.setup', async () => {
 			const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
+			const host = cfg.get<string>('remoteProxyHost', '127.0.0.1');
+			const port = cfg.get<number>('remoteProxyPort', 7890);
 			const type = cfg.get<string>('proxyType', 'http');
+			await syncRemoteHttpProxy(host, port, type);
 			const terminal = vscode.window.createTerminal('Antigravity Setup');
 			terminal.show();
-			const script = generateSetupScript(remoteHost, remotePort, type, extensionPath);
+			const script = generateSetupScript(host, port, type, extensionPath);
 			terminal.sendText(`cat > /tmp/ag_setup.sh << 'EOF'\n${script}\nEOF`);
 			terminal.sendText('bash /tmp/ag_setup.sh');
 		}),
 
-		vscode.commands.registerCommand('antigravity-ssh-proxy.rollback', () => {
+		vscode.commands.registerCommand('antigravity-ssh-proxy.rollback', async () => {
+			const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
+			const host = cfg.get<string>('remoteProxyHost', '127.0.0.1');
+			const port = cfg.get<number>('remoteProxyPort', 7890);
+			const type = cfg.get<string>('proxyType', 'http');
+			await clearRemoteHttpProxyIfManaged(host, port, type);
 			const terminal = vscode.window.createTerminal('Antigravity Rollback');
 			terminal.show();
 			terminal.sendText(generateRollbackScript());
@@ -674,13 +822,13 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 
 			// Test HTTP proxy
 			log(`[Test 3] Testing HTTP proxy connectivity...`);
-			const httpCmd = `curl -x http://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10`;
+			const httpCmd = `curl -I -x http://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 14`;
 			log(`  Command: ${httpCmd}`);
 			let httpOk = false;
 			try {
 				const { stdout } = await execAsync(httpCmd, { timeout: 15000 });
 				const httpCode = stdout.trim();
-				httpOk = httpCode === '200' || httpCode === '301' || httpCode === '302';
+				httpOk = httpCode === '200' || httpCode === '204' || httpCode === '301' || httpCode === '302';
 				const marker = currentProxyType === 'http' ? ' ← Current' : '';
 				log(`  Result: HTTP ${httpCode} ${httpOk ? '✓ OK' : '✗ Failed'}${marker}`);
 			} catch (error) {
@@ -691,13 +839,13 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 
 			// Test SOCKS5 proxy
 			log(`[Test 4] Testing SOCKS5 proxy connectivity...`);
-			const socks5Cmd = `curl -x socks5://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10`;
+			const socks5Cmd = `curl -I -x socks5://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 14`;
 			log(`  Command: ${socks5Cmd}`);
 			let socks5Ok = false;
 			try {
 				const { stdout } = await execAsync(socks5Cmd, { timeout: 15000 });
 				const httpCode = stdout.trim();
-				socks5Ok = httpCode === '200' || httpCode === '301' || httpCode === '302';
+				socks5Ok = httpCode === '200' || httpCode === '204' || httpCode === '301' || httpCode === '302';
 				const marker = currentProxyType === 'socks5' ? ' ← Current' : '';
 				log(`  Result: HTTP ${httpCode} ${socks5Ok ? '✓ OK' : '✗ Failed'}${marker}`);
 			} catch (error) {
@@ -708,12 +856,12 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 
 			// Test SOCKS5H proxy (SOCKS5 with remote DNS resolution)
 			log(`[Test 5] Testing SOCKS5H proxy connectivity (remote DNS)...`);
-			const socks5hCmd = `curl -x socks5h://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10`;
+			const socks5hCmd = `curl -I -x socks5h://${proxyHost}:${proxyPort} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 14`;
 			log(`  Command: ${socks5hCmd}`);
 			try {
 				const { stdout } = await execAsync(socks5hCmd, { timeout: 15000 });
 				const httpCode = stdout.trim();
-				const socks5hOk = httpCode === '200' || httpCode === '301' || httpCode === '302';
+				const socks5hOk = httpCode === '200' || httpCode === '204' || httpCode === '301' || httpCode === '302';
 				log(`  Result: HTTP ${httpCode} ${socks5hOk ? '✓ OK' : '✗ Failed'}`);
 			} catch (error) {
 				log(`  Result: ✗ Failed`);

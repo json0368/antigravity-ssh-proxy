@@ -521,12 +521,12 @@ async function checkExternalConnectivity(remoteProxyHost: string, remoteProxyPor
         
         try {
             const { stdout } = await execAsync(
-                `curl -x ${protocol}://${remoteProxyHost}:${remoteProxyPort} https://www.google.com -o /dev/null -s -w "%{http_code}" --connect-timeout 10`,
+                `curl -I -x ${protocol}://${remoteProxyHost}:${remoteProxyPort} https://www.google.com -o /dev/null -s -w "%{http_code}" --connect-timeout 10 --max-time 14`,
                 { timeout: 15000 }
             );
             const httpCode = stdout.trim();
             
-            if (httpCode === '200' || httpCode === '301' || httpCode === '302') {
+            if (httpCode === '200' || httpCode === '204' || httpCode === '301' || httpCode === '302') {
                 result.success = true;
                 result.httpCode = httpCode;
             } else {
